@@ -1,0 +1,21 @@
+#!/bin/sh
+# Pin modem netdev names whenever one appears, so the name follows the USB port
+# rather than the kernel's probe order. See /usr/sbin/wwan-pin for why this
+# matters (rist2rist miface= / the encoder's selected output interface,
+# wan-failover members).
+#
+# This fires on every netdev event. wwan-pin decides for itself whether anything
+# needs to change and exits silently when nothing does, so running it on
+# unrelated interfaces is harmless.
+
+[ "${ACTION:-}" = "add" ] || exit 0
+[ -n "${DEVICENAME:-}" ] || exit 0
+
+# Only a modem netdev can be in scope. The drivers use wwan*/wwx*/usb*; anything
+# else is not a cellular netdev and needs no rename.
+case "$DEVICENAME" in
+    wwan*|wwx*|usb*) ;;
+    *) exit 0 ;;
+esac
+
+exec /usr/sbin/wwan-pin

@@ -1,0 +1,185 @@
+#!/bin/sh
+##########################################################################
+# wwan-pin -- give every cellular modem a stable interface name.
+#
+# WHY THIS EXISTS
+#
+# The kernel names a modem's netdev (wwan0, wwan1, ...) in PROBE ORDER, so the
+# same physical modem comes up under a different name after a replug, or after
+# a cold boot in which the modems enumerate the other way round.
+# /etc/config/network already binds each modem to a physical USB port:
+#
+#     config interface 'wwan0'
+#         option proto 'modemmanager'
+#         option device '/sys/devices/.../usb2/2-1'
+#
+# but consumers address the modem BY NAME:
+#   - rist2rist: a destination's `interface` becomes the daemon argument
+#     miface=<name> (librist SO_BINDTODEVICE), and the encoder supplies that
+#     name when it selects an output destination via rist2rist.reconcile;
+#   - wan-failover: its member list.
+# When probe order changes, the name refers to the OTHER modem. Nothing errors:
+# the traffic simply leaves by the wrong radio. That is the failure this avoids.
+#
+# WHAT IT DOES
+#
+# Renames each modem's netdev to the name of the UCI interface that declares its
+# USB port, so the name follows the PORT rather than the probe order.
+# /etc/config/network remains the one definition of which port carries which
+# name -- this script holds no mapping of its own.
+#
+# A swap (two modems that came up under each other's name) is resolved with a
+# two-phase rename through temporary names, because renaming wwan1->wwan0 while
+# wwan0 still exists fails with "name in use".
+#
+# Usage:
+#   wwan-pin            reconcile now
+#   wwan-pin --dry-run  report what would change, change nothing
+#
+# Invoked by /etc/hotplug.d/net/30-wwan-pin whenever a netdev appears.
+##########################################################################
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+# Overridable so the self-test can drive a synthetic tree (see tests/). Two
+# seams on purpose: one for the sysfs scan, one for the rename command.
+SYS_CLASS_NET="${SYS_CLASS_NET:-/sys/class/net}"
+IP="${IP:-ip}"
+FUNCTIONS_SH="${FUNCTIONS_SH:-/lib/functions.sh}"
+
+# NO `set -u` IN THIS SCRIPT, deliberately.
+#
+# /lib/functions.sh is not `set -u`-safe. It reads $IPKG_INSTROOT unguarded both
+# in top-level code --
+#     [ -z "$IPKG_INSTROOT" ] && [ -f /lib/config/uci.sh ] && . /lib/config/uci.sh || true
+# -- and inside functions we call, config_load among them:
+#     [ -n "$IPKG_INSTROOT" ] && return 0
+# Under `set -u` either one aborts the shell with "IPKG_INSTROOT: parameter not
+# set" and exit status 2, before any rename happens. Putting the source before
+# `set -u` only fixes the first; the call into config_load still trips it.
+#
+# So every variable this script reads is written defensively with ${x:-...}
+# instead, which is also what the OpenWrt helper layer expects of its callers.
+# shellcheck source=/dev/null
+. "$FUNCTIONS_SH"
+
+log() { logger -t wwan-pin "$*" 2>/dev/null; echo "wwan-pin: $*"; }
+
+real_path() { readlink -f "$1" 2>/dev/null; }
+
+# The netdev whose sysfs device sits at, or below, the configured /sys path.
+# Prints nothing and returns 1 when no netdev matches: the modem is not present.
+netdev_for_device() {
+    local want="$1" d real
+    for d in "$SYS_CLASS_NET"/*; do
+        [ -e "$d/device" ] || continue
+        real=$(real_path "$d/device") || continue
+        [ -n "$real" ] || continue
+        case "$real" in
+            "$want"|"$want"/*) basename "$d"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# A name not currently in use, for the intermediate step. Phase 1 must always be
+# able to vacate a name, including when two modems are swapping.
+free_temp_name() {
+    local n
+    for n in wwtmp0 wwtmp1 wwtmp2 wwtmp3; do
+        [ -e "$SYS_CLASS_NET/$n" ] || { echo "$n"; return 0; }
+    done
+    return 1
+}
+
+# --- the mapping the config declares --------------------------------------
+#
+# "name devpath" per line. Paths and interface names contain no spaces, so a
+# space is a safe field separator and avoids tab handling in heredocs.
+
+TARGETS=""
+
+collect_target() {
+    local cfg="$1" dev
+    config_get dev "$cfg" device
+    # Only an interface bound to a filesystem port path is in scope; one bound
+    # to a bare name is not ours to rename. Any absolute path is accepted --
+    # the scan below only ever walks "$SYS_CLASS_NET", so a path that is not
+    # really a sysfs device simply matches nothing. Requiring a literal /sys
+    # prefix here would also make the logic untestable off-device.
+    case "$dev" in
+        /*) TARGETS="${TARGETS}${cfg} ${dev}
+" ;;
+    esac
+}
+
+config_load network
+config_foreach collect_target interface
+
+[ -n "$TARGETS" ] || exit 0
+
+# --- what has to change ---------------------------------------------------
+#
+# "actual target" per line. A modem with no netdev is skipped: absent is normal.
+
+CHANGES=""
+
+while read -r name dev; do
+    [ -n "${name:-}" ] || continue
+    actual=$(netdev_for_device "$dev") || continue
+    [ "$actual" = "$name" ] && continue
+    CHANGES="${CHANGES}${actual} ${name}
+"
+done <<TARGETS_EOF
+$TARGETS
+TARGETS_EOF
+
+if [ -z "$CHANGES" ]; then
+    [ "$DRY_RUN" = 1 ] && log "all modem names already match the config"
+    exit 0
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+    while read -r actual target; do
+        [ -n "${actual:-}" ] || continue
+        log "would rename ${actual} -> ${target}"
+    done <<CHANGES_EOF
+$CHANGES
+CHANGES_EOF
+    exit 0
+fi
+
+# --- apply: phase 1 vacates every name, phase 2 assigns them --------------
+
+MOVED=""
+rc=0
+
+while read -r actual target; do
+    [ -n "${actual:-}" ] || continue
+    tmp=$(free_temp_name) || { log "no free temporary name; giving up"; rc=1; break; }
+    if $IP link set dev "$actual" name "$tmp" 2>/dev/null; then
+        MOVED="${MOVED}${tmp} ${target}
+"
+        log "vacated ${actual} (-> ${tmp}, will become ${target})"
+    else
+        log "could not rename ${actual} out of the way"
+        rc=1
+    fi
+done <<CHANGES_EOF
+$CHANGES
+CHANGES_EOF
+
+while read -r tmp target; do
+    [ -n "${tmp:-}" ] || continue
+    if $IP link set dev "$tmp" name "$target" 2>/dev/null; then
+        log "pinned ${target} to its configured port"
+    else
+        log "FAILED to rename ${tmp} -> ${target}; it is left as ${tmp}"
+        rc=1
+    fi
+done <<MOVED_EOF
+$MOVED
+MOVED_EOF
+
+exit $rc

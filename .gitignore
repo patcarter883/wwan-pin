@@ -1,0 +1,8 @@
+# Compiled artifacts never belong in a package repo.
+__pycache__/
+*.pyc
+*.o
+*.so
+*.apk
+*.ipk
+build/
