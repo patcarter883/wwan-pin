@@ -17,7 +17,8 @@
 #   - rist2rist: a destination's `interface` becomes the daemon argument
 #     miface=<name> (librist SO_BINDTODEVICE), and the encoder supplies that
 #     name when it selects an output destination via rist2rist.reconcile;
-#   - wan-failover: its member list.
+#   - wan-failover: its member list;
+#   - SQM: each queue's `interface`.
 # When probe order changes, the name refers to the OTHER modem. Nothing errors:
 # the traffic simply leaves by the wrong radio. That is the failure this avoids.
 #
@@ -42,11 +43,14 @@
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
-# Overridable so the self-test can drive a synthetic tree (see tests/). Two
-# seams on purpose: one for the sysfs scan, one for the rename command.
+# Overridable so the self-test can drive a synthetic tree (see tests/). Seams
+# on purpose: the sysfs scan, the rename command, ModemManager's runtime dir.
 SYS_CLASS_NET="${SYS_CLASS_NET:-/sys/class/net}"
+SYS_CLASS_USBMISC="${SYS_CLASS_USBMISC:-/sys/class/usbmisc}"
 IP="${IP:-ip}"
 FUNCTIONS_SH="${FUNCTIONS_SH:-/lib/functions.sh}"
+MM_RUNDIR="${MM_RUNDIR:-/var/run/modemmanager}"
+MM_INIT="${MM_INIT:-/etc/init.d/modemmanager}"
 
 # NO `set -u` IN THIS SCRIPT, deliberately.
 #
@@ -93,6 +97,141 @@ free_temp_name() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# ModemManager's on-disk state -- reconciles it with the names on disk.
+#
+# Renaming a netdev invalidates state ModemManager keeps in MM_RUNDIR, both of
+# it keyed by netdev NAME:
+#
+#   events.cache  "action,devname,subsystem,syspath"  REPLAYED on every start
+#   cdcwdm.cache  "<netdev> <cdc-wdm>"                the control-port map
+#
+# MM's own net hotplug handler is numbered 25 and this script 30, so on a fresh
+# add MM records the PRE-RENAME name first. The rename then leaves a cache entry
+# pointing at a path that no longer exists. MM replays that entry on every start
+# and never expires it, so the modem disappears from `mmcli -L`
+# ("device net/wwan0 not found") and its interface never comes up -- while the
+# USB device, its driver and /dev/cdc-wdm0 are all perfectly healthy.
+#
+# Restarting ModemManager does NOT clear this: the stale cache is the cause and
+# the restart is what replays it. That is the trap -- it looks like a modem
+# problem and is a cache problem. (Observed live: a modem was reported
+# "No modems were found" with `unlock retries: sim-pin2`, which reads as a
+# SIM-PIN fault and is not one.)
+#
+# So drop dead entries, make sure today's mapping is present, and if MM is
+# already running make it re-read the corrected files. Entries belonging to
+# other devices (serial ttys, other modems) are preserved -- this filters, it
+# does not rebuild from scratch.
+# ---------------------------------------------------------------------------
+
+# The cdc-wdm control port that sits beside a netdev in sysfs.
+cdcwdm_for_netdev() {
+    local dev="$1" base d
+    base=$(real_path "$SYS_CLASS_NET/$dev/device") || return 1
+    [ -n "$base" ] || return 1
+    for d in "$base"/usbmisc/cdc-wdm*; do
+        [ -e "$d" ] || continue
+        basename "$d"
+        return 0
+    done
+    return 1
+}
+
+# Every cellular netdev currently present.
+modem_netdevs() {
+    local d
+    for d in "$SYS_CLASS_NET"/wwan* "$SYS_CLASS_NET"/wwx*; do
+        [ -e "$d" ] || continue
+        basename "$d"
+    done
+}
+
+# Rewrite $1 as $2's content, keeping the original in place for readers.
+replace_file() {
+    [ -n "${1:-}" ] && [ -f "${2:-}" ] || return 0
+    cat "$2" > "$1" 2>/dev/null
+    rm -f "$2"
+}
+
+mm_cache_reconcile() {
+    local f tmp line path dev wdm
+
+    [ -d "$MM_RUNDIR" ] || return 0
+
+    # 1. events.cache -- drop entries whose sysfs path has gone. The syspath is
+    #    the LAST field, so strip to the final comma rather than counting.
+    f="$MM_RUNDIR/events.cache"
+    if [ -f "$f" ]; then
+        tmp="$f.wwan-pin.$$"
+        : > "$tmp"
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            path="${line##*,}"
+            if [ -n "$path" ] && [ ! -e "$path" ]; then
+                log "dropped dead ModemManager event: $line"
+                continue
+            fi
+            grep -qxF "$line" "$tmp" 2>/dev/null || printf '%s\n' "$line" >> "$tmp"
+        done < "$f"
+        replace_file "$f" "$tmp"
+    fi
+
+    # 2. cdcwdm.cache -- keep only live netdevs, then ensure the mapping for
+    #    every modem that is actually present.
+    f="$MM_RUNDIR/cdcwdm.cache"
+    if [ -f "$f" ]; then
+        tmp="$f.wwan-pin.$$"
+        : > "$tmp"
+        while read -r dev wdm; do
+            [ -n "$dev" ] || continue
+            if [ ! -e "$SYS_CLASS_NET/$dev" ]; then
+                log "dropped dead ModemManager cdcwdm entry: $dev"
+                continue
+            fi
+            grep -qxF "$dev $wdm" "$tmp" 2>/dev/null || printf '%s %s\n' "$dev" "$wdm" >> "$tmp"
+        done < "$f"
+        for dev in $(modem_netdevs); do
+            wdm=$(cdcwdm_for_netdev "$dev") || continue
+            grep -q "^$dev " "$tmp" 2>/dev/null || printf '%s %s\n' "$dev" "$wdm" >> "$tmp"
+        done
+        replace_file "$f" "$tmp"
+    fi
+
+    # 3. Ensure an event for every modem that is actually present. Pruning
+    #    alone is not enough: when MM's cache has been emptied -- or the modem
+    #    changed USB composition AFTER the rename, so the pin ran while there
+    #    was no MBIM port to see -- there is nothing left to replay and MM still
+    #    reports no modem however correct the mapping looks. The syspaths are
+    #    read from sysfs rather than assumed, and MM's own format is
+    #    "action,devname,subsystem,syspath".
+    f="$MM_RUNDIR/events.cache"
+    [ -f "$f" ] || : > "$f"
+    for dev in $(modem_netdevs); do
+        net=$(real_path "$SYS_CLASS_NET/$dev")
+        if [ -n "$net" ] && ! grep -qxF "add,$dev,net,$net" "$f" 2>/dev/null; then
+            printf 'add,%s,net,%s\n' "$dev" "$net" >> "$f"
+            log "added ModemManager event: add,$dev,net,$net"
+        fi
+        wdm=$(cdcwdm_for_netdev "$dev") || continue
+        wdmp=$(real_path "$SYS_CLASS_USBMISC/$wdm")
+        [ -n "$wdmp" ] || continue
+        if ! grep -qxF "add,$wdm,usbmisc,$wdmp" "$f" 2>/dev/null; then
+            printf 'add,%s,usbmisc,%s\n' "$wdm" "$wdmp" >> "$f"
+            log "added ModemManager event: add,$wdm,usbmisc,$wdmp"
+        fi
+    done
+
+    # 4. If ModemManager is already up it is holding the stale state in memory
+    #    and only reads the cache at start, so have it start again. At boot this
+    #    is usually a no-op -- MM has not started yet and will replay the
+    #    corrected cache itself.
+    if [ -x "$MM_INIT" ] && "$MM_INIT" running >/dev/null 2>&1; then
+        log "restarting ModemManager so it re-reads its corrected cache"
+        "$MM_INIT" restart >/dev/null 2>&1
+    fi
+}
+
 # --- the mapping the config declares --------------------------------------
 #
 # "name devpath" per line. Paths and interface names contain no spaces, so a
@@ -117,7 +256,13 @@ collect_target() {
 config_load network
 config_foreach collect_target interface
 
-[ -n "$TARGETS" ] || exit 0
+# Even with nothing to rename, ModemManager may still be holding a stale entry
+# from an earlier rename, so reconcile before leaving.
+if [ -z "$TARGETS" ]; then
+    [ "$DRY_RUN" = 1 ] && log "no modem is bound to a port path; nothing to pin"
+    [ "$DRY_RUN" = 1 ] || mm_cache_reconcile
+    exit 0
+fi
 
 # --- what has to change ---------------------------------------------------
 #
@@ -136,7 +281,11 @@ $TARGETS
 TARGETS_EOF
 
 if [ -z "$CHANGES" ]; then
-    [ "$DRY_RUN" = 1 ] && log "all modem names already match the config"
+    if [ "$DRY_RUN" = 1 ]; then
+        log "all modem names already match the config"
+    else
+        mm_cache_reconcile
+    fi
     exit 0
 fi
 
@@ -181,5 +330,10 @@ while read -r tmp target; do
 done <<MOVED_EOF
 $MOVED
 MOVED_EOF
+
+# The renames above are what invalidate ModemManager's cache, so this is not
+# optional cleanup -- without it a renamed modem is invisible to MM until
+# someone edits its cache by hand.
+mm_cache_reconcile
 
 exit $rc

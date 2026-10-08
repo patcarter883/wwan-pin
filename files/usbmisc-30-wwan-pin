@@ -1,0 +1,26 @@
+#!/bin/sh
+# Re-run the pin when a cellular control port appears.
+#
+# /etc/hotplug.d/net/30-wwan-pin only fires on a NETDEV add, and a modem can
+# change USB composition AFTER that -- the classic case is the modem coming up
+# as ECM (usb0, no control port) and only switching to MBIM (wwanN + cdc-wdmN)
+# once the mode-switch hook has forced its USB config. By then the rename has
+# already run, and at that moment there was no MBIM port for ModemManager to be
+# told about, so its cache holds nothing for the port that actually matters and
+# `mmcli -L` reports no modem on a device that is working perfectly.
+#
+# Firing on the control port closes that window. wwan-pin decides for itself
+# whether anything needs doing and exits silently when it does not.
+#
+# Observed live: after forcing the modem back to config 3, cdc-wdm0 appeared and
+# the netdev was already correctly named, so nothing re-triggered the
+# reconciliation and the modem stayed invisible until it was run by hand.
+
+[ "${ACTION:-}" = "add" ] || exit 0
+
+case "${DEVICENAME:-}" in
+    cdc-wdm*) ;;
+    *) exit 0 ;;
+esac
+
+exec /usr/sbin/wwan-pin

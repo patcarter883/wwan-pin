@@ -111,7 +111,25 @@ setup_swap() {
     ln -s "$PORT_B/1-2:1.4" "$NET/wwan0/device"   # modem on port B came up wwan0
 }
 
-run() { SYS_CLASS_NET="$NET" IP="$TMP/ip" FUNCTIONS_SH="$TMP/functions.sh" \
+# ModemManager's runtime dir and init script are redirected into the fixture
+# as well: wwan-pin now reconciles MM's on-disk cache, and without an override a
+# test run on a host that really has /var/run/modemmanager would edit the LIVE
+# cache. The init stub records the verbs it was called with.
+MMTMP="$TMP/mmrundir"
+mkdir -p "$MMTMP"
+MM_CALLS="$TMP/mm-calls"
+: > "$MM_CALLS"
+cat > "$TMP/mm-stub" <<'STUB'
+#!/bin/sh
+echo "$1" >> "$MM_CALLS"
+[ "$1" = running ] && exit "${MM_RUNNING_STATE:-1}"
+exit 0
+STUB
+chmod +x "$TMP/mm-stub"
+
+run() { SYS_CLASS_NET="$NET" SYS_CLASS_USBMISC="$TMP/class/usbmisc" \
+        IP="$TMP/ip" FUNCTIONS_SH="$TMP/functions.sh" \
+        MM_RUNDIR="$MMTMP" MM_INIT="$TMP/mm-stub" MM_CALLS="$MM_CALLS" \
         sh "$script" "$@" 2>&1; }
 
 # --- 1. the symptom is real ----------------------------------------------
@@ -162,7 +180,9 @@ config_load() { :; }
 config_get() { eval "$1="; }
 config_foreach() { "$1" lan; }
 STUB
-out=$(SYS_CLASS_NET="$NET" IP="$TMP/ip" FUNCTIONS_SH="$TMP/functions-empty.sh" sh "$script" 2>&1)
+out=$(SYS_CLASS_NET="$NET" IP="$TMP/ip" FUNCTIONS_SH="$TMP/functions-empty.sh" \
+      MM_RUNDIR="$MMTMP" MM_INIT="$TMP/mm-stub" MM_CALLS="$MM_CALLS" \
+      sh "$script" 2>&1)
 check "exit 0 with nothing configured" "$?" "0"
 check "no output with nothing configured" "$out" ""
 
@@ -184,6 +204,7 @@ config_get() { [ -n "$IPKG_INSTROOT" ] && return 0; eval "$1="; }
 config_foreach() { "$1" lan; }
 STUB
 out=$(SYS_CLASS_NET="$NET" IP="$TMP/ip" FUNCTIONS_SH="$TMP/functions-strict.sh" \
+      MM_RUNDIR="$MMTMP" MM_INIT="$TMP/mm-stub" MM_CALLS="$MM_CALLS" \
       sh "$script" --dry-run 2>&1); rc=$?
 check "does not abort on it" "$rc" "0"
 check "no IPKG_INSTROOT error" "$(printf '%s\n' "$out" | grep -c IPKG_INSTROOT || true)" "0"
@@ -191,9 +212,70 @@ check "no IPKG_INSTROOT error" "$(printf '%s\n' "$out" | grep -c IPKG_INSTROOT |
 # and prove the guard is load-bearing: inject `set -u` and it must fail
 sed '2i set -u' "$script" > "$TMP/strict-script"
 out=$(SYS_CLASS_NET="$NET" IP="$TMP/ip" FUNCTIONS_SH="$TMP/functions-strict.sh" \
+      MM_RUNDIR="$MMTMP" MM_INIT="$TMP/mm-stub" MM_CALLS="$MM_CALLS" \
       sh "$TMP/strict-script" --dry-run 2>&1); rc=$?
 check "with set -u added it does fail (so this test has teeth)" \
       "$(printf '%s\n' "$out" | grep -c IPKG_INSTROOT || true)" "1"
+
+# --- 8. ModemManager's cache (the failure this reconciliation exists for) --
+#
+# Renaming a netdev invalidates MM's on-disk cache. It is keyed by netdev NAME
+# and REPLAYED on every MM start, so a rename leaves an entry pointing at a path
+# that no longer exists and MM never expires it. Live, that presented as a modem
+# perfectly healthy on USB (driver bound, /dev/cdc-wdm0 present) reading
+# "No modems were found" -- and with `unlock retries: sim-pin2`, which reads as
+# a SIM-PIN fault and is not one. Restarting MM does not clear it: the stale
+# cache is the cause and the restart is what replays it.
+
+echo "8. ModemManager's cache is reconciled against the names on disk"
+# after tests 4-5: port A is wwan0 and present; port B / wwan1 is absent.
+mkdir -p "$PORT_A/2-1:1.4/usbmisc/cdc-wdm7" "$TMP/class/usbmisc/cdc-wdm7"
+cat > "$MMTMP/events.cache" <<EOF
+add,wwan0,net,$NET/wwan1
+add,ttyS1,tty,/dev/null
+EOF
+cat > "$MMTMP/cdcwdm.cache" <<EOF
+wwan9 cdc-wdm9
+wwan0 cdc-wdm7
+EOF
+out=$(run)
+printf '%s\n' "$out" | sed 's/^/  /'
+check "the dead netdev event was dropped" \
+      "$(grep -c 'net/wwan1' "$MMTMP/events.cache" || true)" "0"
+check "the unrelated tty event was kept" \
+      "$(grep -c 'ttyS1' "$MMTMP/events.cache" || true)" "1"
+check "the dead cdcwdm entry was dropped" \
+      "$(grep -c 'wwan9' "$MMTMP/cdcwdm.cache" || true)" "0"
+check "the live modem's mapping is present" \
+      "$(grep -c '^wwan0 cdc-wdm7$' "$MMTMP/cdcwdm.cache" || true)" "1"
+
+# Pruning alone is NOT enough. When MM's cache has been emptied -- or the modem
+# changed USB composition after the rename, so the pin ran while no MBIM control
+# port existed yet -- there is nothing left to replay and MM reports no modem
+# however correct the mapping looks. The events must be ADDED for every modem
+# that is present, with the syspaths read from sysfs. (Live, this exact gap left
+# a modem invisible after it was switched back to the MBIM composition.)
+check "a net event was added for the live modem" \
+      "$(grep -c '^add,wwan0,net,' "$MMTMP/events.cache" || true)" "1"
+check "a usbmisc event was added for its control port" \
+      "$(grep -c '^add,cdc-wdm7,usbmisc,' "$MMTMP/events.cache" || true)" "1"
+check "no event was invented for the absent modem" \
+      "$(grep -c '^add,wwan1,net,' "$MMTMP/events.cache" || true)" "0"
+
+# With MM not running there is nothing to nudge -- at boot this is the case, and
+# MM replays the corrected cache itself.
+: > "$MM_CALLS"; export MM_RUNNING_STATE=1
+run >/dev/null 2>&1
+check "MM not running -> not restarted" \
+      "$(grep -c restart "$MM_CALLS" || true)" "0"
+
+# With MM running it is holding the stale state in memory and only reads the
+# cache at start, so it must be made to read it again.
+: > "$MM_CALLS"; export MM_RUNNING_STATE=0
+run >/dev/null 2>&1
+check "MM running -> restarted so it re-reads" \
+      "$(grep -c restart "$MM_CALLS" || true)" "1"
+unset MM_RUNNING_STATE
 
 echo
 if [ "$fail" = 0 ]; then

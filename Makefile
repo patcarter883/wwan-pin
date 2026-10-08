@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wwan-pin
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=3
+PKG_RELEASE:=6
 include $(INCLUDE_DIR)/package.mk
 
 define Package/wwan-pin
@@ -21,7 +21,13 @@ define Package/wwan-pin/description
   USB port, so the name follows the physical port rather than the kernel's probe
   order. Without this the same modem can come up as wwan1 after a replug, which
   silently points rist2rist's miface= (the interface the encoder selects as its
-  output destination) and wan-failover's member list at the wrong radio.
+  output destination), wan-failover's member list and each SQM queue at the
+  wrong radio.
+  .
+  Renaming a netdev also invalidates ModemManager's on-disk state, which is
+  keyed by netdev NAME and replayed on every start; without reconciling it the
+  modem disappears from `mmcli -L` while being perfectly healthy on USB. This
+  package reconciles those caches after every rename.
 endef
 
 # No build step: this is shell only.
@@ -34,6 +40,9 @@ define Package/wwan-pin/install
 
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/net
 	$(INSTALL_BIN) ./files/30-wwan-pin $(1)/etc/hotplug.d/net/30-wwan-pin
+
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/usbmisc
+	$(INSTALL_BIN) ./files/usbmisc-30-wwan-pin $(1)/etc/hotplug.d/usbmisc/30-wwan-pin
 endef
 
 $(eval $(call BuildPackage,wwan-pin))
